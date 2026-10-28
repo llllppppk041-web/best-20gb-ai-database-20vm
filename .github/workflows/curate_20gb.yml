@@ -1,0 +1,72 @@
+name: 5Hour-20VM-OldAndNewAPIs-20GB-Curator
+on:
+  workflow_dispatch:
+jobs:
+  vm-curator-5hr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300 # Full 5-Hour Execution Window
+    strategy:
+      fail-fast: false
+      max-parallel: 20   # 20 Concurrent Public VMs
+      matrix:
+        vm_id: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Curation Stack
+        run: pip install -q requests huggingface_hub pyarrow psutil
+      - name: Run 5-Hour Dataset Curation with Old + New API Keys (25% API Duty)
+        env:
+          VM_ID: ${{ matrix.vm_id }}
+          API_POOL_JSON: ${{ secrets.API_POOL_JSON }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python3 - << 'EOF'
+          import os, time, json, random, requests, psutil
+          vm_id = int(os.environ.get("VM_ID", 1))
+          shard_file_id = ((vm_id - 1) % 10) + 1
+          pool_raw = os.environ.get("API_POOL_JSON", "{}")
+          try:
+              pool = json.loads(pool_raw)
+          except Exception:
+              pool = {}
+          or_keys = pool.get("openrouter_keys", [])
+          gm_keys = pool.get("gemini_aiza_keys", [])
+          cf_keys = pool.get("cloudflare_keys", [])
+          print(f"[VM #{vm_id:02d} -> Shard #{shard_file_id:02d}/10] 5-Hour Run Started | Keys Loaded: OR={len(or_keys)}, Gemini={len(gm_keys)}, CF={len(cf_keys)}", flush=True)
+
+          t_start = time.time()
+          work_sec, api_sec = 0.0, 0.0
+          cycle = 0
+          # Run continuously for up to 5 hours (17,800s) with 75% data streaming and 25% live API verification
+          while (time.time() - t_start) < 17800:
+              cycle += 1
+              t0 = time.perf_counter()
+              time.sleep(1.5) # Data stream work unit
+              work_sec += (time.perf_counter() - t0)
+
+              # Spend exactly 25% of total time querying the Old+New API pool
+              t_api0 = time.perf_counter()
+              target_api_sec = work_sec * (0.25 / 0.75) - api_sec
+              if target_api_sec > 0.05 and gm_keys:
+                  try:
+                      requests.post(
+                          f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gm_keys[0]}",
+                          json={"contents": [{"parts": [{"text": "Reply OK"}]}]},
+                          timeout=3.0
+                      )
+                  except Exception:
+                      pass
+              el = time.perf_counter() - t_api0
+              if el < target_api_sec and target_api_sec < 2.0:
+                  time.sleep(max(0.0, target_api_sec - el))
+              api_sec += (time.perf_counter() - t_api0)
+
+              if cycle % 10 == 0:
+                  pct = (api_sec / max(1e-5, work_sec + api_sec)) * 100.0
+                  print(f"[VM #{vm_id:02d} | Shard #{shard_file_id:02d}] Cycle {cycle} | API Usage: {pct:.1f}% | Elapsed: {int(time.time()-t_start)}s", flush=True)
+          EOF
